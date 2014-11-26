@@ -54,6 +54,11 @@ class DashMPD(object):
 
     def _change_to_live(self):
         self.root.set('type', 'dynamic')
+        period = self.root.find(DASH_NAMESPACE + 'Period')
+        try:
+            del period.attrib['duration']
+        except:
+            pass
         for s in self.streams.itervalues():
             s._change_to_live()
 
