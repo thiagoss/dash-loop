@@ -1,7 +1,7 @@
 import itertools
 import os
 from xml.etree import ElementTree
-
+from datetime import datetime, timedelta
 
 DASH_NAMESPACE_RAW='urn:mpeg:DASH:schema:MPD:2011'
 DASH_NAMESPACE='{' + DASH_NAMESPACE_RAW + '}'
@@ -13,16 +13,30 @@ ElementTree.register_namespace('', DASH_NAMESPACE_RAW)
 from flask import Flask, Response, send_from_directory
 app = Flask(__name__)
 
+def count_files(path):
+    fullpath = os.path.join(current_dir, path)
+    return len([name for name in os.listdir(fullpath) if os.path.isfile(os.path.join(fullpath, name))])
+
 class DashAdaptationSet(object):
     def __init__(self, adapt_set):
         self.adaptation_set = adapt_set
+        template = adapt_set.findall(DASH_NAMESPACE + 'SegmentTemplate')[0]
+        self.segment_duration = float(template.get('duration')) / float(template.get('timescale'))
         self.representations = {}
         for r in self.adaptation_set.findall(DASH_NAMESPACE + 'Representation'):
-            self.representations[r.get('id')] = r
+            data = {}
+            data['node'] = r
+            data['fragments-count'] = count_files(r.get('id')) - (1 if self.has_initialization_segment() else 0)
+
+            self.representations[r.get('id')] = data
 
     @property
     def id(self):
         return self.adaptation_set.get('id')
+
+    def has_initialization_segment(self):
+        segtemplate = self.adaptation_set.find(DASH_NAMESPACE + 'SegmentTemplate')
+        return 'initialization' in segtemplate.attrib
 
     def _change_to_live(self):
         pass
@@ -32,7 +46,12 @@ class DashAdaptationSet(object):
 
     def find_matching_fragment(self, repr_id, fragment_number):
         r = self.representations[repr_id]
-        return fragment_number
+        try:
+            fragment_number = int(fragment_number)
+        except ValueError:
+            return fragment_number, 0.0
+
+        return ((fragment_number - 1) % r['fragments-count']) + 1, fragment_number * self.segment_duration
 
 class DashMPD(object):
     def __init__(self, path_to_mpd):
@@ -50,10 +69,17 @@ class DashMPD(object):
             adapt_info = DashAdaptationSet(adaptationset)
             self.streams[adapt_info.id] = adapt_info
 
+        self.start_time = datetime.utcnow()
         self._change_to_live()
 
     def _change_to_live(self):
         self.root.set('type', 'dynamic')
+        try:
+            del self.root.attrib['mediaPresentationDuration']
+        except:
+            pass
+        self.root.set('availabilityStartTime', self.start_time.isoformat())
+
         period = self.root.find(DASH_NAMESPACE + 'Period')
         try:
             del period.attrib['duration']
@@ -67,13 +93,16 @@ class DashMPD(object):
 
     def find_matching_fragment(self, repr_id, fragment_number):
         path = None
+        ts = None
         for s in self.streams.itervalues():
             if s.has_representation_id(repr_id):
-                path = s.find_matching_fragment(repr_id, fragment_number)
+                path, ts = s.find_matching_fragment(repr_id, fragment_number)
                 break
 
         if path:
-            return '%s/%s' % (repr_id, path)
+            if timedelta(0, ts) + self.start_time <= datetime.utcnow():
+                return '%s/%s' % (repr_id, path)
+        return None
 
 mpd = DashMPD('playlist.mpd')
 print mpd.get_mpd_string()
@@ -85,6 +114,8 @@ def playlist(name):
 @app.route("/<string:repr_id>/<string:fragment_number>")
 def fragment(repr_id, fragment_number):
     path = mpd.find_matching_fragment(repr_id, fragment_number)
+    if not path:
+        return '', 404
     return send_from_directory(current_dir, path)
 
 def crossdomain():
